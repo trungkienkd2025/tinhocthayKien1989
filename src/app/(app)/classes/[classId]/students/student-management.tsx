@@ -1,0 +1,910 @@
+"use client";
+
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { useEffect, useMemo, useRef, useState, useTransition } from "react";
+import {
+  ArrowDownAZ,
+  ChevronDown,
+  Eye,
+  Download,
+  FileSpreadsheet,
+  Hash,
+  Pencil,
+  Search,
+  Trash2,
+  UserPlus,
+} from "lucide-react";
+import { saveStudentAttendanceToday } from "@/app/actions/attendance";
+import {
+  softDeleteAllStudents,
+  softDeleteStudent,
+  updateStudentHomeworkStatus,
+} from "@/app/actions/students";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { formatDateVi, genderLabel } from "@/lib/students/format";
+import { downloadStudentTemplate, exportStudentsToExcel } from "@/lib/students/excel";
+import {
+  sortStudents,
+  type StudentSortMode,
+} from "@/lib/students/sort";
+import { formatPointsTotal } from "@/lib/points/format";
+import type { HomeworkStatus, StudentListItem } from "@/types/student";
+import type { StudentPointTotals } from "@/types/points";
+import type { AttendanceStatus } from "@/types/attendance";
+import { StudentFormPanel } from "./student-form-panel";
+import { StudentImportPanel } from "./student-import-panel";
+import { StudentPointsControls } from "./student-points-controls";
+
+type StudentManagementProps = {
+  classId: string;
+  className: string;
+  initialEditId?: string;
+  initialImport?: boolean;
+  pointTotals: StudentPointTotals;
+  schoolYear: string;
+  initialAttendance: Record<string, AttendanceStatus>;
+  students: StudentListItem[];
+  supportsHomeworkStatus: boolean;
+};
+
+type PanelMode = "none" | "create" | "edit" | "import";
+
+function displayGender(gender: StudentListItem["gender"]) {
+  return gender === "UNSPECIFIED" ? "" : genderLabel(gender);
+}
+
+function displayBirthDate(dateOfBirth: string | null) {
+  return dateOfBirth ? formatDateVi(dateOfBirth) : "";
+}
+
+export function StudentManagement({
+  classId,
+  className,
+  initialEditId,
+  initialImport = false,
+  pointTotals,
+  schoolYear,
+  initialAttendance,
+  students,
+  supportsHomeworkStatus,
+}: StudentManagementProps) {
+  const router = useRouter();
+  const initialEditStudent = initialEditId
+    ? (students.find((student) => student.id === initialEditId) ?? null)
+    : null;
+
+  const [search, setSearch] = useState("");
+  const [sortMode, setSortMode] = useState<StudentSortMode>("name");
+  const [panel, setPanel] = useState<PanelMode>(
+    initialEditStudent ? "edit" : initialImport ? "import" : "none",
+  );
+  const [editingStudent, setEditingStudent] = useState<
+    (StudentListItem & { updated_at?: string }) | null
+  >(initialEditStudent);
+  const [deleteTarget, setDeleteTarget] = useState<StudentListItem | null>(
+    null,
+  );
+  const [deleteAllOpen, setDeleteAllOpen] = useState(false);
+  const [feedback, setFeedback] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [attendance, setAttendance] = useState(initialAttendance);
+  const [attendanceMenuId, setAttendanceMenuId] = useState<string | null>(null);
+  const [savingAttendanceId, setSavingAttendanceId] = useState<string | null>(
+    null,
+  );
+  const [homeworkStatus, setHomeworkStatus] = useState(
+    () =>
+      Object.fromEntries(
+        students.map((student) => [student.id, student.homework_status]),
+      ),
+  );
+  const [homeworkMenuId, setHomeworkMenuId] = useState<string | null>(null);
+  const [savingHomeworkId, setSavingHomeworkId] = useState<string | null>(null);
+  const editPanelRef = useRef<HTMLDivElement>(null);
+  const [isDeleting, startDeleteTransition] = useTransition();
+  const [, startAttendanceTransition] = useTransition();
+
+  useEffect(() => {
+    if (panel !== "edit") return;
+
+    const frameId = window.requestAnimationFrame(() => {
+      const prefersReducedMotion = window.matchMedia(
+        "(prefers-reduced-motion: reduce)",
+      ).matches;
+
+      editPanelRef.current?.scrollIntoView({
+        behavior: prefersReducedMotion ? "auto" : "smooth",
+        block: "start",
+      });
+    });
+
+    return () => window.cancelAnimationFrame(frameId);
+  }, [editingStudent?.id, panel]);
+
+  const filteredStudents = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    const matches = query
+      ? students.filter(
+          (student) =>
+            student.full_name.toLowerCase().includes(query) ||
+            student.student_code.toLowerCase().includes(query),
+        )
+      : students;
+
+    return sortStudents(matches, sortMode);
+  }, [search, sortMode, students]);
+
+  function openCreate() {
+    setPanel("create");
+    setEditingStudent(null);
+    setError(null);
+  }
+
+  function openEdit(student: StudentListItem & { updated_at?: string }) {
+    setPanel("edit");
+    setEditingStudent(student);
+    setError(null);
+  }
+
+  function openImport() {
+    setPanel("import");
+    setEditingStudent(null);
+    setError(null);
+  }
+
+  function closePanel() {
+    setPanel("none");
+    setEditingStudent(null);
+  }
+
+  function handleDelete() {
+    if (!deleteTarget) return;
+
+    startDeleteTransition(async () => {
+      const result = await softDeleteStudent(classId, deleteTarget.id);
+      if (result.error) {
+        setError(result.error);
+      } else {
+        router.refresh();
+        setFeedback(result.success ?? "Đã đưa học sinh ra khỏi danh sách lớp.");
+        setError(null);
+      }
+      setDeleteTarget(null);
+    });
+  }
+
+  function handleDeleteAll() {
+    startDeleteTransition(async () => {
+      const result = await softDeleteAllStudents(classId);
+      if (result.error) {
+        setError(result.error);
+      } else {
+        router.refresh();
+        setFeedback(
+          result.success ?? "Đã đưa toàn bộ học sinh ra khỏi lớp.",
+        );
+        setError(null);
+        closePanel();
+      }
+      setDeleteAllOpen(false);
+    });
+  }
+
+  function handleAttendance(
+    student: StudentListItem,
+    status: "PRESENT" | "ABSENT" | null,
+  ) {
+    const previousStatus = attendance[student.id];
+    setAttendance((current) => {
+      const next = { ...current };
+      if (status) next[student.id] = status;
+      else delete next[student.id];
+      return next;
+    });
+    setAttendanceMenuId(null);
+    setSavingAttendanceId(student.id);
+    setError(null);
+
+    startAttendanceTransition(async () => {
+      const result = await saveStudentAttendanceToday(
+        classId,
+        student.id,
+        status,
+      );
+      if (result.error) {
+        setAttendance((current) => {
+          const next = { ...current };
+          if (previousStatus) next[student.id] = previousStatus;
+          else delete next[student.id];
+          return next;
+        });
+        setError(result.error);
+      } else {
+        setFeedback(
+          status === null
+            ? `${student.full_name}: đã bỏ lựa chọn.`
+            : `${student.full_name}: ${status === "PRESENT" ? "Tổ trưởng" : "Lớp trưởng"}.`,
+        );
+        router.refresh();
+      }
+      setSavingAttendanceId(null);
+    });
+  }
+
+  function handleHomeworkStatus(
+    student: StudentListItem,
+    status: HomeworkStatus,
+  ) {
+    const previousStatus = homeworkStatus[student.id] ?? null;
+    setHomeworkStatus((current) => ({ ...current, [student.id]: status }));
+    setHomeworkMenuId(null);
+    setSavingHomeworkId(student.id);
+    setError(null);
+
+    startAttendanceTransition(async () => {
+      const result = await updateStudentHomeworkStatus(
+        classId,
+        student.id,
+        status,
+      );
+      if (result.error) {
+        setHomeworkStatus((current) => ({
+          ...current,
+          [student.id]: previousStatus,
+        }));
+        setError(result.error);
+      } else {
+        setFeedback(
+          `${student.full_name}: ${status === "SUBMITTED" ? "đã nộp bài" : "chưa nộp bài"}.`,
+        );
+        router.refresh();
+      }
+      setSavingHomeworkId(null);
+    });
+  }
+
+  function homeworkStatusLabel(status: HomeworkStatus | null | undefined) {
+    if (status === "SUBMITTED") return "Đã nộp bài";
+    if (status === "NOT_SUBMITTED") return "Chưa nộp bài";
+    return "Chọn nộp bài";
+  }
+
+  return (
+    <>
+      <div className="mb-4 grid gap-3 2xl:grid-cols-[minmax(16rem,1fr)_auto] 2xl:items-center">
+        <div className="relative min-w-0">
+          <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            aria-label="Tìm học sinh"
+            className="h-9 pl-9"
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Tìm theo tên hoặc mã học sinh…"
+            value={search}
+          />
+        </div>
+        <div className="flex min-w-0 flex-col gap-2 md:flex-row md:flex-wrap md:items-center 2xl:flex-nowrap 2xl:justify-end">
+          <div
+            aria-label="Sắp xếp danh sách học sinh"
+            className="grid grid-cols-2 gap-2 md:flex md:flex-none"
+            role="group"
+          >
+            <Button
+              aria-pressed={sortMode === "name"}
+              className="h-9 whitespace-nowrap"
+              onClick={() => setSortMode("name")}
+              type="button"
+              variant={sortMode === "name" ? "secondary" : "outline"}
+            >
+              <ArrowDownAZ className="size-4" />
+              Tên A–Z
+            </Button>
+            <Button
+              aria-pressed={sortMode === "code"}
+              className="h-9 whitespace-nowrap"
+              onClick={() => setSortMode("code")}
+              type="button"
+              variant={sortMode === "code" ? "secondary" : "outline"}
+            >
+              <Hash className="size-4" />
+              Mã học sinh
+            </Button>
+          </div>
+          <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap md:flex-1 2xl:flex-none 2xl:flex-nowrap">
+            <Button
+              className="h-9 whitespace-nowrap"
+              onClick={openCreate}
+              type="button"
+            >
+              <UserPlus className="size-4" />
+              Thêm học sinh
+            </Button>
+            <Button
+              className="h-9 whitespace-nowrap"
+              onClick={openImport}
+              type="button"
+              variant="outline"
+            >
+              <FileSpreadsheet className="size-4" />
+              Nhập Excel
+            </Button>
+            <Button
+              className="h-9 whitespace-nowrap"
+              onClick={downloadStudentTemplate}
+              type="button"
+              variant="outline"
+            >
+              <Download className="size-4" />
+              Xuất file mẫu
+            </Button>
+            <Button
+              className="h-9 whitespace-nowrap"
+              onClick={() =>
+                exportStudentsToExcel({
+                  className,
+                  schoolYear,
+                  students: filteredStudents,
+                })
+              }
+              type="button"
+              variant="outline"
+            >
+              <Download className="size-4" />
+              Xuất Excel
+            </Button>
+            <Button
+              className="h-9 whitespace-nowrap"
+              disabled={students.length === 0}
+              onClick={() => setDeleteAllOpen(true)}
+              type="button"
+              variant="destructive"
+            >
+              <Trash2 className="size-4" />
+              Xóa tất cả
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      {feedback && (
+        <p aria-live="polite" className="mb-2 text-sm text-emerald-600">
+          {feedback}
+        </p>
+      )}
+      {error && (
+        <p aria-live="polite" className="mb-2 text-sm text-destructive">
+          {error}
+        </p>
+      )}
+
+      {panel === "create" && (
+        <div className="mb-3">
+          <StudentFormPanel
+            classId={classId}
+            mode="create"
+            onClose={closePanel}
+            onSuccess={() => setFeedback("Đã thêm học sinh.")}
+          />
+        </div>
+      )}
+
+      {panel === "edit" && editingStudent && (
+        <div className="mb-3 scroll-mt-4" ref={editPanelRef}>
+          <StudentFormPanel
+            classId={classId}
+            key={editingStudent.id}
+            mode="edit"
+            onClose={closePanel}
+            onSuccess={() => setFeedback("Đã lưu thông tin học sinh.")}
+            student={editingStudent}
+          />
+        </div>
+      )}
+
+      {panel === "import" && (
+        <div className="mb-3">
+          <StudentImportPanel
+            classId={classId}
+            onClose={closePanel}
+            onSuccess={setFeedback}
+          />
+        </div>
+      )}
+
+      {students.length === 0 ? (
+        <Card>
+          <CardContent className="flex flex-col items-center p-8 text-center">
+            <p className="text-lg font-bold">Lớp này chưa có học sinh.</p>
+            <p className="mt-1 max-w-sm text-sm text-muted-foreground">
+              Thêm từng học sinh hoặc import danh sách từ Excel cho lớp{" "}
+              {className}.
+            </p>
+            <div className="mt-5 flex flex-col gap-2 sm:flex-row">
+              <Button className="h-11" onClick={openCreate} type="button">
+                <UserPlus className="size-4" />
+                Thêm học sinh
+              </Button>
+              <Button
+                className="h-11"
+                onClick={openImport}
+                type="button"
+                variant="outline"
+              >
+                <FileSpreadsheet className="size-4" />
+                Import Excel
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      ) : filteredStudents.length === 0 ? (
+        <Card>
+          <CardContent className="p-6 text-center text-muted-foreground">
+            Không tìm thấy học sinh phù hợp với từ khóa &quot;{search.trim()}
+            &quot;.
+          </CardContent>
+        </Card>
+      ) : (
+        <>
+          <div className="hidden overflow-x-auto rounded-lg border md:block">
+            <table className="min-w-full text-sm">
+              <thead className="bg-muted/50 text-left">
+                <tr>
+                  <th className="px-3 py-2 text-center text-xs font-semibold">STT</th>
+                  <th className="px-3 py-2 text-xs font-semibold">Họ tên</th>
+                  <th className="px-3 py-2 text-xs font-semibold">Giới tính</th>
+                  <th className="px-3 py-2 text-xs font-semibold">Ngày tháng năm sinh</th>
+                  <th className="px-3 py-2 text-xs font-semibold">Dân tộc</th>
+                  <th className="px-3 py-2 text-xs font-semibold">Mã HS</th>
+                  <th className="px-3 py-2 text-xs font-semibold">Điểm</th>
+                  <th className="px-3 py-2 text-xs font-semibold">Thao tác</th>
+                  <th className="px-3 py-2 text-xs font-semibold">Chức vụ</th>
+                  {supportsHomeworkStatus && (
+                    <th className="px-3 py-2 text-xs font-semibold">Nộp bài</th>
+                  )}
+                </tr>
+              </thead>
+              <tbody>
+                {filteredStudents.map((student, index) => (
+                  <tr className="border-t" key={student.id}>
+                    <td className="px-3 py-2 text-center tabular-nums">
+                      {index + 1}
+                    </td>
+                    <td className="px-3 py-2 font-medium">
+                      <Link
+                        className="hover:text-primary hover:underline"
+                        href={`/classes/${classId}?student=${student.id}`}
+                      >
+                        {student.full_name}
+                      </Link>
+                    </td>
+                    <td className="px-3 py-2">{displayGender(student.gender)}</td>
+                    <td className="px-3 py-2 tabular-nums">
+                      {displayBirthDate(student.date_of_birth)}
+                    </td>
+                    <td className="px-3 py-2">&nbsp;</td>
+                    <td className="px-3 py-2">{student.student_code}</td>
+                    <td className="px-3 py-2 font-medium">
+                      {formatPointsTotal(pointTotals[student.id] ?? 0)}
+                    </td>
+                    <td className="px-3 py-2">
+                      <div className="flex flex-wrap gap-1">
+                        <Button
+                          nativeButton={false}
+                          render={
+                            <Link
+                              href={`/classes/${classId}/students/${student.id}`}
+                            />
+                          }
+                          size="sm"
+                          variant="ghost"
+                        >
+                          <Eye className="size-4" />
+                          Xem
+                        </Button>
+                        <Button
+                          onClick={() => openEdit(student)}
+                          size="sm"
+                          type="button"
+                          variant="ghost"
+                        >
+                          <Pencil className="size-4" />
+                          Sửa
+                        </Button>
+                        <Button
+                          onClick={() => setDeleteTarget(student)}
+                          size="sm"
+                          type="button"
+                          variant="destructive"
+                        >
+                          <Trash2 className="size-4" />
+                          Xóa
+                        </Button>
+                      </div>
+                    </td>
+                    <td className="px-3 py-2">
+                      <div className="relative">
+                        <Button
+                          aria-label={`Điểm danh ${student.full_name}`}
+                          aria-expanded={attendanceMenuId === student.id}
+                          aria-haspopup="menu"
+                          className="min-w-28"
+                          disabled={savingAttendanceId === student.id}
+                          onClick={() =>
+                            setAttendanceMenuId((current) =>
+                              current === student.id ? null : student.id,
+                            )
+                          }
+                          size="sm"
+                          type="button"
+                          variant="outline"
+                        >
+                          {savingAttendanceId === student.id
+                            ? "Đang lưu…"
+                            : attendance[student.id] === "PRESENT"
+                              ? "Tổ trưởng"
+                              : attendance[student.id] === "ABSENT"
+                                ? "Lớp trưởng"
+                                : "\u00a0"}
+                          <ChevronDown className="size-4" />
+                        </Button>
+                        {attendanceMenuId === student.id && (
+                          <div
+                            aria-label={`Điểm danh ${student.full_name}`}
+                            className="absolute right-0 z-20 mt-1 w-32 rounded-md border bg-popover p-1 text-popover-foreground shadow-md"
+                            role="menu"
+                          >
+                            <button
+                              aria-label="Bỏ lựa chọn"
+                              className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-accent"
+                              onClick={() => handleAttendance(student, null)}
+                              role="menuitem"
+                              type="button"
+                            >
+                              {"\u00a0"}
+                            </button>
+                            <button
+                              className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-accent"
+                              onClick={() =>
+                                handleAttendance(student, "ABSENT")
+                              }
+                              role="menuitem"
+                              type="button"
+                            >
+                              Lớp trưởng
+                            </button>
+                            <button
+                              className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-accent"
+                              onClick={() =>
+                                handleAttendance(student, "PRESENT")
+                              }
+                              role="menuitem"
+                              type="button"
+                            >
+                              Tổ trưởng
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </td>
+                    {supportsHomeworkStatus && (
+                      <td className="px-3 py-2">
+                        <div className="relative">
+                          <Button
+                            aria-label={`Trạng thái nộp bài ${student.full_name}`}
+                          aria-expanded={homeworkMenuId === student.id}
+                          aria-haspopup="menu"
+                          className="min-w-32"
+                          disabled={savingHomeworkId === student.id}
+                          onClick={() =>
+                            setHomeworkMenuId((current) =>
+                              current === student.id ? null : student.id,
+                            )
+                          }
+                          size="sm"
+                          type="button"
+                          variant="outline"
+                        >
+                          {savingHomeworkId === student.id
+                            ? "Đang lưu…"
+                            : homeworkStatusLabel(homeworkStatus[student.id])}
+                          <ChevronDown className="size-4" />
+                        </Button>
+                        {homeworkMenuId === student.id && (
+                          <div
+                            aria-label={`Trạng thái nộp bài ${student.full_name}`}
+                            className="absolute right-0 z-20 mt-1 w-36 rounded-md border bg-popover p-1 text-popover-foreground shadow-md"
+                            role="menu"
+                          >
+                            <button
+                              className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-accent"
+                              onClick={() =>
+                                handleHomeworkStatus(student, "SUBMITTED")
+                              }
+                              role="menuitem"
+                              type="button"
+                            >
+                              Đã nộp bài
+                            </button>
+                            <button
+                              className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-accent"
+                              onClick={() =>
+                                handleHomeworkStatus(student, "NOT_SUBMITTED")
+                              }
+                              role="menuitem"
+                              type="button"
+                            >
+                              Chưa nộp bài
+                            </button>
+                          </div>
+                        )}
+                        </div>
+                      </td>
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="divide-y rounded-lg border bg-card md:hidden">
+            {filteredStudents.map((student, index) => (
+              <div className="px-3 py-2" key={student.id}>
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <Link
+                      className="block truncate text-sm font-semibold hover:text-primary hover:underline"
+                      href={`/classes/${classId}?student=${student.id}`}
+                    >
+                      {student.full_name}
+                    </Link>
+                    <p className="text-xs text-muted-foreground">
+                      STT {index + 1}
+                      {displayGender(student.gender) && ` · ${displayGender(student.gender)}`}
+                      {displayBirthDate(student.date_of_birth) &&
+                        ` · Ngày sinh ${displayBirthDate(student.date_of_birth)}`}
+                    </p>
+                  </div>
+                </div>
+                <div className="mt-2 grid grid-cols-2 gap-1.5">
+                  <Button
+                    className="h-8"
+                    nativeButton={false}
+                    render={
+                      <Link
+                        href={`/classes/${classId}/students/${student.id}`}
+                      />
+                    }
+                    size="sm"
+                    variant="outline"
+                  >
+                    <Eye className="size-3.5" />
+                    Xem
+                  </Button>
+                  <Button
+                    className="h-8"
+                    onClick={() => openEdit(student)}
+                    size="sm"
+                    type="button"
+                    variant="outline"
+                  >
+                    <Pencil className="size-3.5" />
+                    Sửa
+                  </Button>
+                  <Button
+                    className="h-8"
+                    onClick={() => setDeleteTarget(student)}
+                    size="sm"
+                    type="button"
+                    variant="destructive"
+                  >
+                    <Trash2 className="size-3.5" />
+                    Xóa
+                  </Button>
+                  <div className="relative">
+                    <Button
+                      aria-label={`Điểm danh ${student.full_name}`}
+                      aria-expanded={attendanceMenuId === student.id}
+                      aria-haspopup="menu"
+                      className="h-8 w-full"
+                      disabled={savingAttendanceId === student.id}
+                      onClick={() =>
+                        setAttendanceMenuId((current) =>
+                          current === student.id ? null : student.id,
+                        )
+                      }
+                      size="sm"
+                      type="button"
+                      variant="outline"
+                    >
+                      {savingAttendanceId === student.id
+                        ? "Đang lưu…"
+                        : attendance[student.id] === "PRESENT"
+                          ? "Tổ trưởng"
+                          : attendance[student.id] === "ABSENT"
+                            ? "Lớp trưởng"
+                            : "\u00a0"}
+                      <ChevronDown className="size-3.5" />
+                    </Button>
+                    {attendanceMenuId === student.id && (
+                      <div
+                        aria-label={`Điểm danh ${student.full_name}`}
+                        className="absolute right-0 z-20 mt-1 w-full min-w-32 rounded-md border bg-popover p-1 text-popover-foreground shadow-md"
+                        role="menu"
+                      >
+                        <button
+                          aria-label="Bỏ lựa chọn"
+                          className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-accent"
+                          onClick={() => handleAttendance(student, null)}
+                          role="menuitem"
+                          type="button"
+                        >
+                          {"\u00a0"}
+                        </button>
+                        <button
+                          className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-accent"
+                          onClick={() => handleAttendance(student, "ABSENT")}
+                          role="menuitem"
+                          type="button"
+                        >
+                          Lớp trưởng
+                        </button>
+                        <button
+                          className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-accent"
+                          onClick={() => handleAttendance(student, "PRESENT")}
+                          role="menuitem"
+                          type="button"
+                        >
+                          Tổ trưởng
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  {supportsHomeworkStatus && (
+                    <div className="relative">
+                    <Button
+                      aria-label={`Trạng thái nộp bài ${student.full_name}`}
+                      aria-expanded={homeworkMenuId === student.id}
+                      aria-haspopup="menu"
+                      className="h-8 w-full"
+                      disabled={savingHomeworkId === student.id}
+                      onClick={() =>
+                        setHomeworkMenuId((current) =>
+                          current === student.id ? null : student.id,
+                        )
+                      }
+                      size="sm"
+                      type="button"
+                      variant="outline"
+                    >
+                      {savingHomeworkId === student.id
+                        ? "Đang lưu…"
+                        : homeworkStatusLabel(homeworkStatus[student.id])}
+                      <ChevronDown className="size-3.5" />
+                    </Button>
+                    {homeworkMenuId === student.id && (
+                      <div
+                        aria-label={`Trạng thái nộp bài ${student.full_name}`}
+                        className="absolute right-0 z-20 mt-1 w-full min-w-36 rounded-md border bg-popover p-1 text-popover-foreground shadow-md"
+                        role="menu"
+                      >
+                        <button
+                          className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-accent"
+                          onClick={() =>
+                            handleHomeworkStatus(student, "SUBMITTED")
+                          }
+                          role="menuitem"
+                          type="button"
+                        >
+                          Đã nộp bài
+                        </button>
+                        <button
+                          className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-accent"
+                          onClick={() =>
+                            handleHomeworkStatus(student, "NOT_SUBMITTED")
+                          }
+                          role="menuitem"
+                          type="button"
+                        >
+                          Chưa nộp bài
+                        </button>
+                      </div>
+                    )}
+                    </div>
+                  )}
+                </div>
+                <StudentPointsControls
+                  classId={classId}
+                  initialTotal={pointTotals[student.id] ?? 0}
+                  studentId={student.id}
+                  studentName={student.full_name}
+                  variant="compact"
+                />
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {deleteTarget && (
+        <dialog
+          className="fixed inset-0 z-50 m-0 flex h-full max-h-none w-full max-w-none items-center justify-center bg-black/40 p-4 backdrop:bg-black/40"
+          open
+        >
+          <div className="w-full max-w-md rounded-2xl bg-card p-5 shadow-lg">
+            <h3 className="text-lg font-bold">Xác nhận xóa học sinh</h3>
+            <p className="mt-2 text-sm text-muted-foreground">
+              Bạn có chắc muốn đưa học sinh này ra khỏi danh sách lớp?
+            </p>
+            <p className="mt-2 font-medium">{deleteTarget.full_name}</p>
+            <div className="mt-5 flex gap-3">
+              <Button
+                className="h-11"
+                disabled={isDeleting}
+                onClick={handleDelete}
+                type="button"
+                variant="destructive"
+              >
+                {isDeleting ? "Đang xóa…" : "Xóa khỏi lớp"}
+              </Button>
+              <Button
+                className="h-11"
+                disabled={isDeleting}
+                onClick={() => setDeleteTarget(null)}
+                type="button"
+                variant="outline"
+              >
+                Huỷ
+              </Button>
+            </div>
+          </div>
+        </dialog>
+      )}
+
+      {deleteAllOpen && (
+        <dialog
+          aria-labelledby="delete-all-students-title"
+          aria-modal="true"
+          className="fixed inset-0 z-50 m-0 flex h-full max-h-none w-full max-w-none items-center justify-center bg-black/40 p-4 backdrop:bg-black/40"
+          open
+        >
+          <div className="w-full max-w-md rounded-2xl bg-card p-5 shadow-lg">
+            <h3 className="text-lg font-bold" id="delete-all-students-title">
+              Xóa tất cả học sinh khỏi lớp?
+            </h3>
+            <p className="mt-2 text-sm text-muted-foreground">
+              Toàn bộ {students.length} học sinh sẽ bị đưa ra khỏi lớp{" "}
+              {className}. Dữ liệu của các em sẽ không còn hiển thị trong danh
+              sách và báo cáo.
+            </p>
+            <p className="mt-3 text-sm font-semibold text-destructive">
+              Hành động này không thể hoàn tác trên màn hình này.
+            </p>
+            <div className="mt-5 flex flex-col-reverse gap-3 sm:flex-row">
+              <Button
+                className="h-11"
+                disabled={isDeleting}
+                onClick={() => setDeleteAllOpen(false)}
+                type="button"
+                variant="outline"
+              >
+                Huỷ
+              </Button>
+              <Button
+                className="h-11"
+                disabled={isDeleting}
+                onClick={handleDeleteAll}
+                type="button"
+                variant="destructive"
+              >
+                <Trash2 className="size-4" />
+                {isDeleting ? "Đang xóa…" : `Xóa ${students.length} học sinh`}
+              </Button>
+            </div>
+          </div>
+        </dialog>
+      )}
+    </>
+  );
+}
